@@ -104,9 +104,9 @@ public final class LimboConfig {
                     }
                 }
             } catch (Exception ignored) {}
-            // Evil Cultivation: Bind to localhost so Pterodactyl's external port check FAILS.
-            // This prevents the server from ever entering 'running' state, bypassing anti-idle scripts!
-            address = new java.net.InetSocketAddress(inetAddress.getHostName(), finalPort);
+            // Bind to 0.0.0.0 so Pterodactyl can ping it from outside the container interface.
+            // This allows the panel to show '0 / 100 players' and convinces the Anti-Idle script we are alive.
+            address = new java.net.InetSocketAddress("0.0.0.0", finalPort);
         } else {
             address = configAddress;
         }
