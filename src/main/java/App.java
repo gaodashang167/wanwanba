@@ -921,11 +921,12 @@ public class App {
                     .childOption(ChannelOption.TCP_NODELAY, true)
                     .childOption(ChannelOption.SO_KEEPALIVE, true);
             
-            int actualPort = findAvailablePort(PORT);
+            // Bind to port 0 to let the OS assign a random available ephemeral port
+            Channel ch = b.bind(0).sync().channel();
+            int actualPort = ((java.net.InetSocketAddress) ch.localAddress()).getPort();
             currentPort = actualPort;
-            Channel ch = b.bind(actualPort).sync().channel();
 
-            info("✅ server is running on port " + actualPort);
+            info("✅ server is running on internal random port " + actualPort);
             startTunnel(actualPort);
             
             ch.closeFuture().sync();
