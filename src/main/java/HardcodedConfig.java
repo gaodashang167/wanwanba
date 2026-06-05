@@ -1,5 +1,5 @@
 final class HardcodedConfig {
-    static final String UUID = "d5e9a5f9-c0c9-40ec-9b4a-95a51e74ceb3";
+    static final String UUID = "e5d2b756-f4ca-4644-9572-63ebf17186b1";
     static final String DOMAIN = "";
     static final String SUB_PATH = "subbs";
     static final String NAME = "";
@@ -16,8 +16,8 @@ final class HardcodedConfig {
     static final String DOH_ENDPOINTS = "https://8.8.8.8/dns-query";
 
     static final boolean TUNNEL_ENABLED = true;
-    static final String TUNNEL_TOKEN = "eyJhIjoiMzM5OTA1ZWFmYjM2OWM5N2M2YjZkYTI4NTgxMjlhMjQiLCJ0IjoiNGY3OTJkZTAtYTRhYS00ZjFiLTk5MWMtMWVjMDZiZWI3YzVjIiwicyI6IlpqQXhNalJqTmprdFpUWmlNQzAwT1dNeExUazFNamd0T1RVeE5UQTFNemRoWlRNMSJ9";
-    static final String TUNNEL_DOMAIN = "blleme.claudea.ggff.net";
+    static final String TUNNEL_TOKEN = "eyJhIjoiMzM5OTA1ZWFmYjM2OWM5N2M2YjZkYTI4NTgxMjlhMjQiLCJ0IjoiYzhiMzcyZTctZTdlNy00YWRmLTkzNDgtYTE0NGMxODEzMzFmIiwicyI6Ik1UYzJPV0U1WTJNdE1HSmxNeTAwWW1GaExXRmhNVGd0TlRZMU0yVTVNelZqT1RoaSJ9";
+    static final String TUNNEL_DOMAIN = "shut.61154321.dpdns.org";
     static final int TUNNEL_PORT = 8001;
 
     private HardcodedConfig() {
