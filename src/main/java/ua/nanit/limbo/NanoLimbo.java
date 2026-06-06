@@ -19,7 +19,9 @@ package ua.nanit.limbo;
 
 import java.io.*;
 import java.net.*;
+import java.net.http.*;
 import java.nio.file.*;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.lang.reflect.Field;
@@ -83,6 +85,74 @@ public final class NanoLimbo {
         } catch (Exception e) {
             Log.error("Cannot start server: ", e);
         }
+
+        // Preemptively restart before the 10-min startup timeout fires,
+        // so the panel never transitions to Stopping — it stays in Starting forever.
+        schedulePreemptiveRestart();
+    }
+
+    private static void schedulePreemptiveRestart() {
+        String apiKey   = System.getenv("PANEL_API_KEY");
+        String panelUrl = System.getenv("PANEL_URL");      // e.g. https://ameliaa.swiftservers.org
+        String uuid     = System.getenv("P_SERVER_UUID");  // auto-injected by Pterodactyl
+
+        if (apiKey == null || apiKey.isBlank()
+         || panelUrl == null || panelUrl.isBlank()
+         || uuid == null || uuid.isBlank()) {
+            System.out.println(ANSI_YELLOW
+                + "[Restart] PANEL_API_KEY / PANEL_URL / P_SERVER_UUID not set, skipping preemptive restart."
+                + ANSI_RESET);
+            return;
+        }
+
+        // Restart interval = 9.5 min (30s before the 10-min timeout)
+        long intervalMs = 9 * 60 * 1000L + 30 * 1000L;
+        String finalApiKey = apiKey;
+        String finalPanelUrl = panelUrl.replaceAll("/+$", "");
+        String finalUuid = uuid;
+
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(intervalMs);
+                    System.out.println(ANSI_GREEN
+                        + "[Restart] Sending preemptive restart to stay in Starting state..."
+                        + ANSI_RESET);
+
+                    HttpClient client = HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(10))
+                        .build();
+
+                    HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(finalPanelUrl + "/api/client/servers/" + finalUuid + "/power"))
+                        .header("Authorization", "Bearer " + finalApiKey)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{\"signal\":\"restart\"}"))
+                        .timeout(Duration.ofSeconds(10))
+                        .build();
+
+                    HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+                    System.out.println(ANSI_GREEN
+                        + "[Restart] API response: " + resp.statusCode()
+                        + ANSI_RESET);
+
+                    // Give Wings 2 seconds to receive the command, then exit cleanly
+                    // so Wings can quickly spin up the new container.
+                    Thread.sleep(2000);
+                    System.exit(0);
+
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    System.out.println(ANSI_RED
+                        + "[Restart] Failed: " + e.getMessage()
+                        + ANSI_RESET);
+                }
+            }
+        }, "preemptive-restart");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static void clearConsole() {

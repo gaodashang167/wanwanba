@@ -120,8 +120,7 @@ public final class LimboServer {
             }
         }, "NanoLimbo shutdown thread"));
 
-        // Suppress: panel detects 'Server started on' via log regex and marks us Online.
-        // Log.info("Server started on %s", config.getAddress());
+        Log.info("Server started on %s", config.getAddress());
 
         commandManager = new CommandManager();
         commandManager.registerAll(this);
