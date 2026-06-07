@@ -1,16 +1,20 @@
 package ua.nanit.limbo.server.commands;
 
 import ua.nanit.limbo.server.Command;
-
-import ua.nanit.limbo.server.Log;
+import ua.nanit.limbo.server.LimboServer;
 
 public class CmdStop implements Command {
 
+    private final LimboServer server;
+
+    public CmdStop(LimboServer server) {
+        this.server = server;
+    }
+
     @Override
     public void execute() {
-        Log.info("Stopping server...");
-        // 邪修大法好: Ignore the stop command so the process survives the panel's kill attempt!
-        // System.exit(0);
+        server.stop();
+        System.exit(0);
     }
 
     @Override

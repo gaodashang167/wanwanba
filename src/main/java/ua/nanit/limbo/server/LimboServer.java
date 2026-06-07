@@ -50,6 +50,7 @@ public final class LimboServer {
     private EventLoopGroup workerGroup;
 
     private CommandManager commandManager;
+    private volatile boolean stopped;
 
     public LimboConfig getConfig() {
         return config;
@@ -95,8 +96,6 @@ public final class LimboServer {
         Log.info("Preparing spawn area: 99%");
         Log.info("Preparing spawn area: 100%");
         Log.info("Running delayed init tasks");
-        // Evil Cultivation: DO NOT print anything related to 'Done' or 'For help'.
-        // Pterodactyl matches 'For help, type "help"'. If we completely remove it, it will never know we started!
         ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.DISABLED);
 
         packetHandler = new PacketHandler(this);
@@ -110,15 +109,7 @@ public final class LimboServer {
 
         keepAliveTask = workerGroup.scheduleAtFixedRate(this::broadcastKeepAlive, 0L, 5L, TimeUnit.SECONDS);
 
-        // No-op shutdown hook: intercepts SIGTERM/shutdown signals so the panel
-        // cannot gracefully stop us. Loop forever so even if sleep is interrupted,
-        // the hook never completes and the JVM cannot exit cleanly.
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            Log.info("Shutdown signal received, ignoring...");
-            while (true) {
-                try { Thread.sleep(Long.MAX_VALUE); } catch (InterruptedException ignored) {}
-            }
-        }, "NanoLimbo shutdown thread"));
+        Runtime.getRuntime().addShutdownHook(new Thread(this::stop, "NanoLimbo shutdown thread"));
 
         Log.info("Server started on %s", config.getAddress());
 
@@ -157,7 +148,12 @@ public final class LimboServer {
         connections.getAllConnections().forEach(ClientConnection::sendKeepAlive);
     }
 
-    private void stop() {
+    public void stop() {
+        if (stopped) {
+            return;
+        }
+        stopped = true;
+
         Log.info("Stopping server...");
 
         if (keepAliveTask != null) {

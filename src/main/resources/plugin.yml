@@ -1,5 +1,0 @@
-name: NanoLimbo
-version: 1.21.1
-main: ua.nanit.limbo.PluginMain
-api-version: '1.20'
-description: NanoLimbo Proxy Plugin

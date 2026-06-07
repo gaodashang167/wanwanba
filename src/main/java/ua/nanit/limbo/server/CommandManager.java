@@ -53,7 +53,7 @@ public final class CommandManager extends Thread {
         register(new CmdHelp(server), "help");
         register(new CmdConn(server), "conn");
         register(new CmdMem(), "mem");
-        register(new CmdStop(), "stop");
+        register(new CmdStop(server), "stop");
         register(new CmdVersion(), "version", "ver");
     }
 }

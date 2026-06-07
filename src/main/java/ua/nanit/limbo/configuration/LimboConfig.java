@@ -104,9 +104,7 @@ public final class LimboConfig {
                     }
                 }
             } catch (Exception ignored) {}
-            // Bind to 0.0.0.0 so the process keeps a port open and doesn't get killed by startup timeout.
-            // We intentionally do NOT log 'Server started on ...' so the panel never detects us as Online.
-            address = new java.net.InetSocketAddress("0.0.0.0", finalPort);
+            address = new java.net.InetSocketAddress(inetAddress.getHostString(), finalPort);
         } else {
             address = configAddress;
         }

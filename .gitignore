@@ -42,7 +42,6 @@ Desktop.ini
 
 # 运行时文件
 sbx
-komari-agent
 /world/
 *.pid
 boot.log
