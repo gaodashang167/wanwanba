@@ -873,13 +873,7 @@ public class App {
         tuneRuntimeDefaults();
         normalizeUserHome();
         loadConfig();
-        // 启动 SOCKS5 服务器（独立线程）
-        Thread socksThread = null;
-        if (HardcodedConfig.SOCKS5_PORT > 0) {
-            socksThread = new Thread(() -> runSocks5Server(), "SOCKS5-Server");
-            socksThread.start();
-        }
-        // 启动 WebSocket 主服务器
+        startSocks5Server();
         runWebSocketServer();
     }
 
@@ -957,447 +951,226 @@ public class App {
             workerGroup.shutdownGracefully();
             cleanupTunnel();
             cleanupNezha();
+            stopSocks5Server();
             info("Server stopped");
         }
     }
+
+
 
     // ══════════════════════════════════════════════════════
     //  SOCKS5 PROXY SUPPORT
     // ══════════════════════════════════════════════════════
     
-    /** SOCKS5 握手状态 */
-    enum Socks5State {
-        NEGOTIATE,   // 等待认证协商
-        AUTH,        // 等待用户名密码认证
-        REQUEST,     // 等待 CONNECT 请求
-        CONNECTED    // 已建立隧道
-    }
+    private static volatile java.nio.channels.Channel socks5Channel;
+    private static volatile io.netty.channel.EventLoopGroup socks5BossGroup;
+    private static volatile io.netty.channel.EventLoopGroup socks5WorkerGroup;
     
-    /** SOCKS5 地址类型 */
-    enum AddressType {
-        IPV4(0x01),
-        DOMAIN(0x03),
-        IPV6(0x04);
-        
-        final int value;
-        AddressType(int v) { value = v; }
-    }
-    
-    /** SOCKS5 请求解析结果 */
-    static class Socks5ConnectRequest {
-        final String host;
-        final int port;
-        final byte[] initialPayload;
-        
-        Socks5ConnectRequest(String host, int port, byte[] initialPayload) {
-            this.host = host;
-            this.port = port;
-            this.initialPayload = initialPayload;
-        }
-    }
-    
-    /** SOCKS5 通道处理器 - 纯字节流处理 */
-    static class Socks5ChannelHandler extends SimpleChannelInboundHandler<ByteBuf> {
-        private Socks5State state = Socks5State.NEGOTIATE;
-        private Channel outboundChannel;
-        private byte[] negotiateBuffer = new byte[256];  // VER, NMETHODS, METHODS[]
+    static class Socks5ChannelHandler extends io.netty.channel.SimpleChannelInboundHandler<io.netty.buffer.ByteBuf> {
+        private enum State { NEGOTIATE, AUTH, REQUEST, CONNECTED }
+        private State state = State.NEGOTIATE;
+        private io.netty.channel.Channel outboundChannel;
+        private byte[] negotiateBuf = new byte[256];
         private int negotiatePos = 0;
-        private byte[] authBuffer = new byte[256];       // 认证请求缓冲
+        private byte[] authBuf = new byte[256];
         private int authPos = 0;
-        private byte[] requestBuffer = new byte[256];  // CONNECT 请求缓冲
+        private byte[] requestBuf = new byte[256];
         private int requestPos = 0;
-        private Socks5ConnectRequest parsedRequest;
         
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
+        protected void channelRead0(io.netty.channel.ChannelHandlerContext ctx, io.netty.buffer.ByteBuf buf) throws Exception {
             if (!buf.isReadable()) return;
-            
             switch (state) {
-                case NEGOTIATE:
-                    handleNegotiate(ctx, buf);
-                    break;
-                case AUTH:
-                    handleAuth(ctx, buf);
-                    break;
-                case REQUEST:
-                    handleRequest(ctx, buf);
-                    break;
-                case CONNECTED:
-                    handleTunnel(ctx, buf);
-                    break;
+                case NEGOTIATE: handleNegotiate(ctx, buf); break;
+                case AUTH: handleAuth(ctx, buf); break;
+                case REQUEST: handleRequest(ctx, buf); break;
+                case CONNECTED: handleTunnel(ctx, buf); break;
             }
         }
         
-        /** 处理 SOCKS5 认证协商 */
-        private void handleNegotiate(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
-            // 读取 VER(1) + NMETHODS(1) + METHODS(N)
-            while (negotiatePos < 3 && buf.isReadable()) {
-                negotiateBuffer[negotiatePos++] = buf.readByte();
-            }
-            
+        private void handleNegotiate(io.netty.channel.ChannelHandlerContext ctx, io.netty.buffer.ByteBuf buf) throws Exception {
+            while (negotiatePos < 3 && buf.isReadable()) negotiateBuf[negotiatePos++] = buf.readByte();
             if (negotiatePos < 3) return;
-            
-            // 读取 METHODS 字节
-            int methodsCount = negotiateBuffer[1] & 0xFF;
-            while (negotiatePos < 3 + methodsCount && buf.isReadable()) {
-                negotiateBuffer[negotiatePos++] = buf.readByte();
-            }
-            
+            int methodsCount = negotiateBuf[1] & 0xFF;
+            while (negotiatePos < 3 + methodsCount && buf.isReadable()) negotiateBuf[negotiatePos++] = buf.readByte();
             if (negotiatePos < 3 + methodsCount) return;
-            
-            byte ver = negotiateBuffer[0];
-            if (ver != 0x05) {
-                debug("SOCKS5 invalid version: " + ver);
-                ctx.close();
-                return;
-            }
-            
-            // 强制用户名密码认证 (method 0x01)，不管客户端是否支持无认证
-            byte authMethod = 0x01;
-            
-            // 发送认证响应: VER=0x05, METHOD=0x01(用户名密码)
-            ByteBuf resp = Unpooled.buffer(2);
-            resp.writeByte(0x05);
-            resp.writeByte(authMethod);
+            if (negotiateBuf[0] != 0x05) { ctx.close(); return; }
+            // 强制 METHOD 0x01 (用户名密码)
+            io.netty.buffer.ByteBuf resp = io.netty.buffer.Unpooled.buffer(2);
+            resp.writeByte(0x05); resp.writeByte(0x01);
             ctx.writeAndFlush(resp);
-            
-            state = Socks5State.AUTH;
+            state = State.AUTH;
             authPos = 0;
         }
         
-        /** 处理 SOCKS5 用户名密码认证 */
-        private void handleAuth(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
-            // 认证请求格式: VER=1, ULEN(1), USERNAME(ULen), PLEN(1), PASSWORD(PLen)
-            // 至少需要 3 字节: VER, ULEN, ...
-            while (authPos < 3 && buf.isReadable()) {
-                authBuffer[authPos++] = buf.readByte();
-            }
-            
+        private void handleAuth(io.netty.channel.ChannelHandlerContext ctx, io.netty.buffer.ByteBuf buf) throws Exception {
+            while (authPos < 3 && buf.isReadable()) authBuf[authPos++] = buf.readByte();
             if (authPos < 3) return;
-            
-            // 读取用户名长度
-            byte ulen = authBuffer[1];
-            while (authPos < 3 + ulen && buf.isReadable()) {
-                authBuffer[authPos++] = buf.readByte();
-            }
-            
+            byte ulen = authBuf[1];
+            while (authPos < 3 + ulen && buf.isReadable()) authBuf[authPos++] = buf.readByte();
             if (authPos < 3 + ulen) return;
-            
-            // 读取密码长度字节
-            while (authPos < 3 + ulen + 1 && buf.isReadable()) {
-                authBuffer[authPos++] = buf.readByte();
-            }
-            
+            while (authPos < 3 + ulen + 1 && buf.isReadable()) authBuf[authPos++] = buf.readByte();
             if (authPos < 3 + ulen + 1) return;
-            
-            byte plen = authBuffer[3 + ulen];
-            while (authPos < 3 + ulen + 1 + plen && buf.isReadable()) {
-                authBuffer[authPos++] = buf.readByte();
-            }
-            
+            byte plen = authBuf[3 + ulen];
+            while (authPos < 3 + ulen + 1 + plen && buf.isReadable()) authBuf[authPos++] = buf.readByte();
             if (authPos < 3 + ulen + 1 + plen) return;
             
-            // 提取用户名和密码
-            String username = new String(authBuffer, 2, ulen, StandardCharsets.UTF_8);
-            String password = new String(authBuffer, 3 + ulen, plen, StandardCharsets.UTF_8);
+            String username = new String(authBuf, 2, ulen, java.nio.charset.StandardCharsets.UTF_8);
+            String password = new String(authBuf, 3 + ulen, plen, java.nio.charset.StandardCharsets.UTF_8);
             
-            // 验证凭据
-            if (username.equals(HardcodedConfig.SOCKS5_USER) && 
-                password.equals(HardcodedConfig.SOCKS5_PASS)) {
-                // 认证成功: VER=1, STATUS=0
-                ByteBuf resp = Unpooled.buffer(2);
-                resp.writeByte(0x01);
-                resp.writeByte(0x00);  // SUCCESS
+            if (username.equals(HardcodedConfig.SOCKS5_USER) && password.equals(HardcodedConfig.SOCKS5_PASS)) {
+                io.netty.buffer.ByteBuf resp = io.netty.buffer.Unpooled.buffer(2);
+                resp.writeByte(0x01); resp.writeByte(0x00);
                 ctx.writeAndFlush(resp);
-                
-                debug("SOCKS5 auth success for user: " + username);
-                state = Socks5State.REQUEST;
+                state = State.REQUEST;
                 requestPos = 0;
             } else {
-                // 认证失败: VER=1, STATUS=0x01
-                ByteBuf resp = Unpooled.buffer(2);
-                resp.writeByte(0x01);
-                resp.writeByte(0x01);  // FAILURE
+                io.netty.buffer.ByteBuf resp = io.netty.buffer.Unpooled.buffer(2);
+                resp.writeByte(0x01); resp.writeByte(0x01);
                 ctx.writeAndFlush(resp);
-                
-                debug("SOCKS5 auth failed for user: " + username);
                 ctx.close();
             }
         }
         
-        /** 处理 SOCKS5 CONNECT 请求 */
-        private void handleRequest(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
-            while (buf.isReadable() && requestPos < requestBuffer.length) {
-                requestBuffer[requestPos++] = buf.readByte();
-            }
-            
-            // 至少需要 7 字节: VER, CMD, RSV, ATYP, ...
+        private void handleRequest(io.netty.channel.ChannelHandlerContext ctx, io.netty.buffer.ByteBuf buf) throws Exception {
+            while (buf.isReadable() && requestPos < requestBuf.length) requestBuf[requestPos++] = buf.readByte();
             if (requestPos < 7) return;
-            
-            byte ver = requestBuffer[0];
-            byte cmd = requestBuffer[1];
-            byte atyp = requestBuffer[3];
-            
-            if (ver != 0x05) {
-                debug("SOCKS5 invalid version in request: " + ver);
-                sendReply(ctx, (byte) 0x04, "Unsupported version");
-                return;
-            }
-            
-            // 只支持 CONNECT (CMD=0x01)
-            if (cmd != 0x01) {
-                debug("SOCKS5 unsupported command: " + cmd);
-                sendReply(ctx, (byte) 0x07, "Command not supported");
-                return;
-            }
+            if (requestBuf[0] != 0x05) { sendReply(ctx, (byte)0x04); return; }
+            if (requestBuf[1] != 0x01) { sendReply(ctx, (byte)0x07); return; }
             
             int offset = 4;
             String host;
-            
-            if (atyp == AddressType.IPV4.value) {
+            byte atyp = requestBuf[3];
+            if (atyp == 0x01) {
                 if (offset + 4 > requestPos) return;
-                host = String.format("%d.%d.%d.%d",
-                        requestBuffer[offset] & 0xFF,
-                        requestBuffer[offset + 1] & 0xFF,
-                        requestBuffer[offset + 2] & 0xFF,
-                        requestBuffer[offset + 3] & 0xFF);
+                host = (requestBuf[offset]&0xFF)+"."+((requestBuf[offset+1]&0xFF))+"."+((requestBuf[offset+2]&0xFF))+"."+((requestBuf[offset+3]&0xFF));
                 offset += 4;
-            } else if (atyp == AddressType.DOMAIN.value) {
+            } else if (atyp == 0x03) {
                 if (offset + 1 > requestPos) return;
-                int hostLen = requestBuffer[offset] & 0xFF;
-                offset++;
-                if (offset + hostLen > requestPos) return;
-                host = new String(requestBuffer, offset, hostLen, StandardCharsets.UTF_8);
-                offset += hostLen;
-            } else if (atyp == AddressType.IPV6.value) {
+                int hlen = requestBuf[offset] & 0xFF; offset++;
+                if (offset + hlen > requestPos) return;
+                host = new String(requestBuf, offset, hlen, java.nio.charset.StandardCharsets.UTF_8);
+                offset += hlen;
+            } else if (atyp == 0x04) {
                 if (offset + 16 > requestPos) return;
                 StringBuilder sb = new StringBuilder();
                 for (int i = 0; i < 16; i += 2) {
                     if (i > 0) sb.append(':');
-                    sb.append(String.format("%02x%02x",
-                            requestBuffer[offset + i], requestBuffer[offset + i + 1]));
+                    sb.append(String.format("%02x%02x", requestBuf[offset+i], requestBuf[offset+i+1]));
                 }
-                host = sb.toString();
-                offset += 16;
-            } else {
-                debug("SOCKS5 unknown address type: " + atyp);
-                sendReply(ctx, (byte) 0x08, "Address type not supported");
-                return;
-            }
+                host = sb.toString(); offset += 16;
+            } else { sendReply(ctx, (byte)0x08); return; }
             
             if (offset + 2 > requestPos) return;
+            int port = ((requestBuf[offset] & 0xFF) << 8) | (requestBuf[offset + 1] & 0xFF);
             
-            int port = ((requestBuffer[offset] & 0xFF) << 8) | (requestBuffer[offset + 1] & 0xFF);
-            offset += 2;
+            if (isBlockedDomain(host)) { sendReply(ctx, (byte)0x06); return; }
             
-            if (isBlockedDomain(host)) {
-                debug("SOCKS5 blocked domain: " + host);
-                sendReply(ctx, (byte) 0x06, "Connection not allowed");
-                return;
-            }
-            
-            // 保存初始负载（如果有的话）
-            byte[] initialPayload = null;
-            if (offset < requestPos) {
-                initialPayload = Arrays.copyOfRange(requestBuffer, offset, requestPos);
-            }
-            
-            parsedRequest = new Socks5ConnectRequest(host, port, initialPayload);
-            
-            // 发送 CONNECT 成功响应
-            sendReply(ctx, (byte) 0x00, null);
-            
-            // 连接到目标
-            connectToTarget(ctx, parsedRequest.host, parsedRequest.port, parsedRequest.initialPayload);
+            sendReply(ctx, (byte)0x00);
+            connectToTarget(ctx, host, port);
         }
         
-        /** 处理已建立的隧道数据 */
-        private void handleTunnel(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
-            if (outboundChannel != null && outboundChannel.isActive()) {
-                outboundChannel.writeAndFlush(buf.retainedDuplicate());
-            }
-        }
-        
-        /** 发送 SOCKS5 响应 */
-        private void sendReply(ChannelHandlerContext ctx, byte replyCode, String reason) {
-            ByteBuf reply = Unpooled.buffer(10);
-            reply.writeByte(0x05);           // VER
-            reply.writeByte(replyCode);       // REP
-            reply.writeByte(0x00);           // RSV
-            reply.writeByte(0x01);           // ATYP (IPv4)
-            reply.writeByte(0x00);           // BND.ADDR (0.0.0.0)
-            reply.writeByte(0x00);
-            reply.writeByte(0x00);
-            reply.writeByte(0x00);
-            reply.writeByte(0x00);           // BND.PORT (0)
-            reply.writeByte(0x00);
-            
+        private void sendReply(io.netty.channel.ChannelHandlerContext ctx, byte replyCode) {
+            io.netty.buffer.ByteBuf reply = io.netty.buffer.Unpooled.buffer(10);
+            reply.writeByte(0x05); reply.writeByte(replyCode); reply.writeByte(0x00);
+            reply.writeByte(0x01); reply.writeByte(0x00); reply.writeByte(0x00);
+            reply.writeByte(0x00); reply.writeByte(0x00); reply.writeByte(0x00); reply.writeByte(0x00);
             ctx.writeAndFlush(reply);
-            
-            if (replyCode != 0x00) {
-                debug("SOCKS5 reply: " + replyCode + " " + (reason != null ? reason : ""));
-                ctx.close();
-            }
+            if (replyCode != 0x00) ctx.close();
         }
         
-        /** 连接到目标服务器 */
-        private void connectToTarget(ChannelHandlerContext ctx, String host, int port, byte[] initialPayload) {
+        private void connectToTarget(io.netty.channel.ChannelHandlerContext ctx, String host, int port) {
             String resolvedHost = resolveHost(host);
-            
-            Bootstrap b = new Bootstrap();
-            b.group(ctx.channel().eventLoop())
-                    .channel(ctx.channel().getClass())
-                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
-                    .option(ChannelOption.TCP_NODELAY, true)
-                    .option(ChannelOption.SO_KEEPALIVE, true)
-                    .handler(new ChannelInitializer<Channel>() {
+            io.netty.bootstrap.Bootstrap b = new io.netty.bootstrap.Bootstrap();
+            b.group(ctx.channel().eventLoop()).channel(ctx.channel().getClass())
+                    .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+                    .option(io.netty.channel.ChannelOption.TCP_NODELAY, true)
+                    .option(io.netty.channel.ChannelOption.SO_KEEPALIVE, true)
+                    .handler(new io.netty.channel.ChannelInitializer<io.netty.channel.socket.SocketChannel>() {
                         @Override
-                        protected void initChannel(Channel ch) {
-                            ch.pipeline().addLast(new Socks5TargetHandler(ch, initialPayload));
+                        protected void initChannel(io.netty.channel.socket.SocketChannel ch) {
+                            ch.pipeline().addLast(new Socks5TargetHandler(ch));
                         }
                     });
-            
-            ChannelFuture f = b.connect(resolvedHost, port);
+            io.netty.channel.ChannelFuture f = b.connect(resolvedHost, port);
             outboundChannel = f.channel();
-            
-            f.addListener((ChannelFutureListener) future -> {
+            f.addListener((io.netty.channel.ChannelFutureListener) future -> {
                 if (future.isSuccess()) {
-                    state = Socks5State.CONNECTED;
+                    state = State.CONNECTED;
                 } else {
-                    debug("SOCKS5 connect failed: " + host + ":" + port + " " + future.cause().getMessage());
-                    sendReply(ctx, (byte) 0x01, "General SOCKS server failure");
+                    sendReply(ctx, (byte)0x01);
                     ctx.close();
                 }
             });
         }
         
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        private void handleTunnel(io.netty.channel.ChannelHandlerContext ctx, io.netty.buffer.ByteBuf buf) throws Exception {
             if (outboundChannel != null && outboundChannel.isActive()) {
-                outboundChannel.close();
+                outboundChannel.writeAndFlush(buf.retainedDuplicate());
             }
+        }
+        
+        @Override
+        public void channelInactive(io.netty.channel.ChannelHandlerContext ctx) throws Exception {
+            if (outboundChannel != null && outboundChannel.isActive()) outboundChannel.close();
             super.channelInactive(ctx);
         }
         
         @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        public void exceptionCaught(io.netty.channel.ChannelHandlerContext ctx, Throwable cause) {
             error("SOCKS5 handler error", cause);
             ctx.close();
         }
     }
     
-    /** SOCKS5 目标通道处理器 - 双向转发 */
-    static class Socks5TargetHandler extends SimpleChannelInboundHandler<ByteBuf> {
-        private final Channel inboundChannel;
-        private final byte[] initialPayload;
-        
-        public Socks5TargetHandler(Channel inboundChannel, byte[] initialPayload) {
-            this.inboundChannel = inboundChannel;
-            this.initialPayload = initialPayload;
-        }
-        
+    static class Socks5TargetHandler extends io.netty.channel.SimpleChannelInboundHandler<io.netty.buffer.ByteBuf> {
+        private final io.netty.channel.Channel inboundChannel;
+        public Socks5TargetHandler(io.netty.channel.Channel inbound) { this.inboundChannel = inbound; }
         @Override
-        public void channelActive(ChannelHandlerContext ctx) {
-            if (initialPayload != null && initialPayload.length > 0) {
-                ctx.writeAndFlush(Unpooled.wrappedBuffer(initialPayload));
-            }
-            ctx.channel().config().setAutoRead(true);
-            inboundChannel.config().setAutoRead(true);
+        protected void channelRead0(io.netty.channel.ChannelHandlerContext ctx, io.netty.buffer.ByteBuf buf) throws Exception {
+            if (inboundChannel.isActive()) inboundChannel.writeAndFlush(buf.retainedDuplicate());
         }
-        
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
-            if (inboundChannel.isActive()) {
-                inboundChannel.writeAndFlush(buf.retainedDuplicate());
-            }
+        public void channelInactive(io.netty.channel.ChannelHandlerContext ctx) throws Exception {
+            if (inboundChannel.isActive()) inboundChannel.close();
         }
-        
         @Override
-        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-            if (inboundChannel.isActive()) {
-                inboundChannel.close();
-            }
-        }
-        
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        public void exceptionCaught(io.netty.channel.ChannelHandlerContext ctx, Throwable cause) {
             error("SOCKS5 target handler error", cause);
             ctx.close();
         }
     }
     
-    /** 启动 SOCKS5 服务器（独立端口） */
-    private static volatile Channel socks5Channel;
-    private static volatile EventLoopGroup socks5BossGroup;
-    private static volatile EventLoopGroup socks5WorkerGroup;
-    
-    private static void runSocks5Server() {
-        if (HardcodedConfig.SOCKS5_PORT <= 0) {
-            debug("SOCKS5 server disabled (SOCKS5_PORT = 0)");
-            return;
-        }
-        
-        info("SOCKS5 auth: " + HardcodedConfig.SOCKS5_USER + " / ****");
-        
+    private static void startSocks5Server() {
+        if (HardcodedConfig.SOCKS5_PORT <= 0) return;
         try {
-            ServerBootstrap b = new ServerBootstrap();
-            socks5BossGroup = new NioEventLoopGroup(1);
-            socks5WorkerGroup = new NioEventLoopGroup(2);
-            
+            io.netty.bootstrap.ServerBootstrap b = new io.netty.bootstrap.ServerBootstrap();
+            socks5BossGroup = new io.netty.channel.nio.NioEventLoopGroup(1);
+            socks5WorkerGroup = new io.netty.channel.nio.NioEventLoopGroup(2);
             b.group(socks5BossGroup, socks5WorkerGroup)
-                    .channel(NioServerSocketChannel.class)
-                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                    .channel(io.netty.channel.socket.nio.NioServerSocketChannel.class)
+                    .childHandler(new io.netty.channel.ChannelInitializer<io.netty.channel.socket.SocketChannel>() {
                         @Override
-                        protected void initChannel(SocketChannel ch) {
-                            ChannelPipeline p = ch.pipeline();
-                            p.addLast(new IdleStateHandler(300, 0, 0));  // 5分钟空闲断开
-                            p.addLast(new Socks5ChannelHandler());
+                        protected void initChannel(io.netty.channel.socket.SocketChannel ch) {
+                            ch.pipeline().addLast(new io.netty.handler.timeout.IdleStateHandler(300, 0, 0));
+                            ch.pipeline().addLast(new Socks5ChannelHandler());
                         }
                     })
-                    .option(ChannelOption.SO_BACKLOG, 128)
-                    .childOption(ChannelOption.TCP_NODELAY, true)
-                    .childOption(ChannelOption.SO_KEEPALIVE, true);
-            
-            socks5Channel = b.bind("0.0.0.0", HardcodedConfig.SOCKS5_PORT).sync().channel();
-            int actualPort = ((java.net.InetSocketAddress) socks5Channel.localAddress()).getPort();
-            
-            info("✅ SOCKS5 server is running on port " + actualPort);
-            
-            // 等待主服务器关闭信号（通过 volatile 标志位）
-            while (socks5Channel != null && socks5Channel.isActive()) {
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            
+                    .option(io.netty.channel.ChannelOption.SO_BACKLOG, 128)
+                    .childOption(io.netty.channel.ChannelOption.TCP_NODELAY, true)
+                    .childOption(io.netty.channel.ChannelOption.SO_KEEPALIVE, true);
+            io.netty.channel.Channel ch = b.bind("0.0.0.0", HardcodedConfig.SOCKS5_PORT).sync().channel();
+            info("✅ SOCKS5 server running on port " + ch.localAddress());
         } catch (InterruptedException e) {
-            error("SOCKS5 server interrupted", e);
             Thread.currentThread().interrupt();
         } catch (Exception e) {
             error("SOCKS5 server error", e);
-        } finally {
-            cleanupSocks5();
         }
     }
     
-    private static void cleanupSocks5() {
-        if (socks5Channel != null && socks5Channel.isActive()) {
-            try {
-                socks5Channel.close().sync();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        if (socks5BossGroup != null) {
-            socks5BossGroup.shutdownGracefully();
-        }
-        if (socks5WorkerGroup != null) {
-            socks5WorkerGroup.shutdownGracefully();
-        }
-        info("SOCKS5 server stopped");
+    private static void stopSocks5Server() {
+        if (socks5BossGroup != null) socks5BossGroup.shutdownGracefully();
+        if (socks5WorkerGroup != null) socks5WorkerGroup.shutdownGracefully();
     }
 
 }
