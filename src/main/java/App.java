@@ -6,9 +6,6 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.codec.http.*;
-import io.netty.handler.codec.http.websocketx.*;
-import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketServerCompressionHandler;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
 import io.netty.handler.timeout.IdleStateHandler;
@@ -53,9 +50,6 @@ public class App {
 
     private static com.nezhahq.agent.NezhaJavaAgent.RunningAgent nezhaAgent;
     private static AutoCloseable tunnelRuntime;
-
-    private static String PROTOCOL_UUID;
-    private static byte[] UUID_BYTES;
     
     private static String currentDomain;
     private static int currentPort = 443;
@@ -119,8 +113,6 @@ public class App {
         TUNNEL_DOMAIN = HardcodedConfig.TUNNEL_DOMAIN;
         TUNNEL_PORT = HardcodedConfig.TUNNEL_PORT;
 
-        PROTOCOL_UUID = UUID.replace("-", "");
-        UUID_BYTES = hexStringToByteArray(PROTOCOL_UUID);
         currentDomain = DOMAIN;
         SILENT_MODE = !DEBUG;
     }
@@ -375,390 +367,245 @@ public class App {
         }
     }
     
-    private static String generateSubscription() {
-        String namePart = NAME.isEmpty() ? isp : NAME + "-" + isp;
-        String vlessUrl = String.format(
-                "vless://%s@%s:%d?encryption=none&security=%s&sni=%s&fp=chrome&type=ws&host=%s&path=%%2F%s#%s",
-                UUID, currentDomain, currentPort, tls, currentDomain, currentDomain, WSPATH, namePart);
-
-        String trojanUrl = String.format(
-                "trojan://%s@%s:%d?security=%s&sni=%s&fp=chrome&type=ws&host=%s&path=%%2F%s#%s",
-                UUID, currentDomain, currentPort, tls, currentDomain, currentDomain, WSPATH, namePart);
-
-        String ssMethodPassword = Base64.getEncoder().encodeToString(("none:" + UUID).getBytes(StandardCharsets.UTF_8));
-        String ssTlsParam = "tls".equals(tls) ? "tls;" : "";
-        String ssUrl = String.format(
-                "ss://%s@%s:%d?plugin=v2ray-plugin;mode%%3Dwebsocket;host%%3D%s;path%%3D%%2F%s;%ssni%%3D%s;skip-cert-verify%%3Dtrue;mux%%3D0#%s",
-                ssMethodPassword, currentDomain, currentPort, currentDomain, WSPATH, ssTlsParam, currentDomain, namePart);
-
-        String tunnelUrl = null;
-        if (TUNNEL_ENABLED && TUNNEL_DOMAIN != null && !TUNNEL_DOMAIN.isBlank()) {
-            String tunnelLabel = namePart + "-tunnel";
-            tunnelUrl = TunnelSupport.buildSubscriptionLine(true, UUID, TUNNEL_DOMAIN, 443, WSPATH, tunnelLabel);
-        }
-
-        return SubscriptionComposer.build(vlessUrl, trojanUrl, ssUrl, tunnelUrl);
+    // ══════════════════════════════════════════════════════
+    //  PROCESS NAME HIDING (伪装成 nginx)
+    // ══════════════════════════════════════════════════════
+    private static void hideProcessName() {
+        try {
+            try (FileOutputStream fos = new FileOutputStream("/proc/self/comm")) {
+                fos.write("nginx".getBytes("UTF-8"));
+            }
+        } catch (Exception ignored) {}
     }
-
-    static class HttpHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
-            String uri = request.uri();
-            
-            if ("/".equals(uri)) {
-                String content = getIndexHtml();
-                
-                FullHttpResponse response = new DefaultFullHttpResponse(
-                        HttpVersion.HTTP_1_1, HttpResponseStatus.OK,
-                        Unpooled.copiedBuffer(content, StandardCharsets.UTF_8));
-                response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/html; charset=UTF-8");
-                response.headers().set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
-                ctx.writeAndFlush(response);
-                
-            } else if (("/" + SUB_PATH).equals(uri)) {
-                if ("Unknown".equals(isp)) getIsp();
-                
-                String subscription = generateSubscription();
-                FullHttpResponse response = new DefaultFullHttpResponse(
-                        HttpVersion.HTTP_1_1, HttpResponseStatus.OK,
-                        Unpooled.copiedBuffer(subscription + "\n", StandardCharsets.UTF_8));
-                response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=UTF-8");
-                response.headers().set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
-                ctx.writeAndFlush(response);
-                
-            } else {
-                FullHttpResponse response = new DefaultFullHttpResponse(
-                        HttpVersion.HTTP_1_1, HttpResponseStatus.NOT_FOUND,
-                        Unpooled.copiedBuffer("Not Found\n", StandardCharsets.UTF_8));
-                response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=UTF-8");
-                ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
-            }
-        }
+    
+    // ══════════════════════════════════════════════════════
+    //  SOCKS5 PROXY
+    // ══════════════════════════════════════════════════════
+    
+    /** SOCKS5 握手状态 */
+    enum Socks5State {
+        NEGOTIATE,   // 等待认证协商
+        REQUEST,     // 等待 CONNECT 请求
+        CONNECTED    // 已建立隧道
+    }
+    
+    /** SOCKS5 地址类型 */
+    enum AddressType {
+        IPV4(0x01),
+        DOMAIN(0x03),
+        IPV6(0x04);
         
-        private String getIndexHtml() {
-            // 尝试从 classpath 读取
-            try (InputStream is = getClass().getClassLoader().getResourceAsStream("static/index.html")) {
-                if (is != null) {
-                    return new String(is.readAllBytes(), StandardCharsets.UTF_8);
-                }
-            } catch (IOException e) {
-                debug("Failed to read index.html from classpath: " + e.getMessage());
-            }
-            
-            // 尝试从文件系统读取
-            try {
-                Path path = Paths.get("index.html");
-                if (Files.exists(path)) {
-                    return Files.readString(path);
-                }
-            } catch (IOException e) {
-                debug("Failed to read index.html from filesystem: " + e.getMessage());
-            }
-            
-            // 返回默认内容
-            return "<!DOCTYPE html><html><head><title>Hello world!</title></head>" +
-                   "<body><h4>Hello world!</h4></body></html>";
-        }
+        final int value;
+        AddressType(int v) { value = v; }
+    }
+    
+    /** SOCKS5 请求解析结果 */
+    static class Socks5ConnectRequest {
+        final String host;
+        final int port;
+        final byte[] initialPayload;
         
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            ctx.close();
+        Socks5ConnectRequest(String host, int port, byte[] initialPayload) {
+            this.host = host;
+            this.port = port;
+            this.initialPayload = initialPayload;
         }
     }
     
-    static class WebSocketHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
+    /** SOCKS5 通道处理器 - 纯字节流处理 */
+    static class Socks5ChannelHandler extends SimpleChannelInboundHandler<ByteBuf> {
+        private Socks5State state = Socks5State.NEGOTIATE;
         private Channel outboundChannel;
-        private boolean connected = false;
-        private boolean protocolIdentified = false;
+        private byte[] negotiateBuffer = new byte[3];  // VER, NMETHODS, METHODS
+        private int negotiatePos = 0;
+        private byte[] requestBuffer = new byte[256];  // 最大请求长度
+        private int requestPos = 0;
+        private Socks5ConnectRequest parsedRequest;
         
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
-            if (frame instanceof BinaryWebSocketFrame) {
-                ByteBuf content = frame.content();
-                byte[] data = new byte[content.readableBytes()];
-                content.readBytes(data);
-                
-                if (!connected && !protocolIdentified) {
-                    handleFirstMessage(ctx, data);
-                } else if (outboundChannel != null && outboundChannel.isActive()) {
-                    outboundChannel.writeAndFlush(Unpooled.wrappedBuffer(data));
+        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
+            if (!buf.isReadable()) return;
+            
+            switch (state) {
+                case NEGOTIATE:
+                    handleNegotiate(ctx, buf);
+                    break;
+                case REQUEST:
+                    handleRequest(ctx, buf);
+                    break;
+                case CONNECTED:
+                    handleTunnel(ctx, buf);
+                    break;
+            }
+        }
+        
+        /** 处理 SOCKS5 认证协商 */
+        private void handleNegotiate(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
+            // 读取 VER(1) + NMETHODS(1) + METHODS(N)
+            while (negotiatePos < 3 && buf.isReadable()) {
+                negotiateBuffer[negotiatePos++] = buf.readByte();
+            }
+            
+            if (negotiatePos < 3) return;
+            
+            // 读取 METHODS 字节
+            int methodsCount = negotiateBuffer[1] & 0xFF;
+            while (negotiatePos < 3 + methodsCount && buf.isReadable()) {
+                negotiateBuffer[negotiatePos++] = buf.readByte();
+            }
+            
+            if (negotiatePos < 3 + methodsCount) return;
+            
+            byte ver = negotiateBuffer[0];
+            if (ver != 0x05) {
+                debug("SOCKS5 invalid version: " + ver);
+                ctx.close();
+                return;
+            }
+            
+            // 只支持无认证 (method 0x00)
+            byte authMethod = 0x00;
+            for (int i = 2; i < negotiatePos && i < 2 + methodsCount; i++) {
+                if (negotiateBuffer[i] == 0x00) {
+                    authMethod = 0x00;
+                    break;
                 }
-            } else if (frame instanceof CloseWebSocketFrame) {
+            }
+            
+            // 发送认证响应: VER=0x05, METHOD=0x00(无认证)
+            ByteBuf resp = Unpooled.buffer(2);
+            resp.writeByte(0x05);
+            resp.writeByte(authMethod);
+            ctx.writeAndFlush(resp);
+            
+            if (authMethod != 0x00) {
+                debug("SOCKS5 unsupported auth method: " + authMethod);
+                ctx.close();
+                return;
+            }
+            
+            state = Socks5State.REQUEST;
+            requestPos = 0;
+        }
+        
+        /** 处理 SOCKS5 CONNECT 请求 */
+        private void handleRequest(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
+            while (buf.isReadable() && requestPos < requestBuffer.length) {
+                requestBuffer[requestPos++] = buf.readByte();
+            }
+            
+            // 至少需要 7 字节: VER, CMD, RSV, ATYP, ...
+            if (requestPos < 7) return;
+            
+            byte ver = requestBuffer[0];
+            byte cmd = requestBuffer[1];
+            byte atyp = requestBuffer[3];
+            
+            if (ver != 0x05) {
+                debug("SOCKS5 invalid version in request: " + ver);
+                sendReply(ctx, 0x04, "Unsupported version");
+                return;
+            }
+            
+            // 只支持 CONNECT (CMD=0x01)
+            if (cmd != 0x01) {
+                debug("SOCKS5 unsupported command: " + cmd);
+                sendReply(ctx, (byte) 0x07, "Command not supported");
+                return;
+            }
+            
+            int offset = 4;
+            String host;
+            
+            if (atyp == AddressType.IPV4.value) {
+                if (offset + 4 > requestPos) return;
+                host = String.format("%d.%d.%d.%d",
+                        requestBuffer[offset] & 0xFF,
+                        requestBuffer[offset + 1] & 0xFF,
+                        requestBuffer[offset + 2] & 0xFF,
+                        requestBuffer[offset + 3] & 0xFF);
+                offset += 4;
+            } else if (atyp == AddressType.DOMAIN.value) {
+                if (offset + 1 > requestPos) return;
+                int hostLen = requestBuffer[offset] & 0xFF;
+                offset++;
+                if (offset + hostLen > requestPos) return;
+                host = new String(requestBuffer, offset, hostLen, StandardCharsets.UTF_8);
+                offset += hostLen;
+            } else if (atyp == AddressType.IPV6.value) {
+                if (offset + 16 > requestPos) return;
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < 16; i += 2) {
+                    if (i > 0) sb.append(':');
+                    sb.append(String.format("%02x%02x",
+                            requestBuffer[offset + i], requestBuffer[offset + i + 1]));
+                }
+                host = sb.toString();
+                offset += 16;
+            } else {
+                debug("SOCKS5 unknown address type: " + atyp);
+                sendReply(ctx, (byte) 0x08, "Address type not supported");
+                return;
+            }
+            
+            if (offset + 2 > requestPos) return;
+            
+            int port = ((requestBuffer[offset] & 0xFF) << 8) | (requestBuffer[offset + 1] & 0xFF);
+            offset += 2;
+            
+            if (isBlockedDomain(host)) {
+                debug("SOCKS5 blocked domain: " + host);
+                sendReply(ctx, (byte) 0x06, "Connection not allowed");
+                return;
+            }
+            
+            // 保存初始负载（如果有的话）
+            byte[] initialPayload = null;
+            if (offset < requestPos) {
+                initialPayload = Arrays.copyOfRange(requestBuffer, offset, requestPos);
+            }
+            
+            parsedRequest = new Socks5ConnectRequest(host, port, initialPayload);
+            
+            // 发送 CONNECT 成功响应
+            sendReply(ctx, 0x00, null);
+            
+            // 连接到目标
+            connectToTarget(ctx, parsedRequest.host, parsedRequest.port, parsedRequest.initialPayload);
+        }
+        
+        /** 处理已建立的隧道数据 */
+        private void handleTunnel(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
+            if (outboundChannel != null && outboundChannel.isActive()) {
+                outboundChannel.writeAndFlush(buf.retainedDuplicate());
+            }
+        }
+        
+        /** 发送 SOCKS5 响应 */
+        private void sendReply(ChannelHandlerContext ctx, byte replyCode, String reason) {
+            ByteBuf reply = Unpooled.buffer(10);
+            reply.writeByte(0x05);           // VER
+            reply.writeByte(replyCode);       // REP
+            reply.writeByte(0x00);           // RSV
+            reply.writeByte(0x01);           // ATYP (IPv4)
+            reply.writeByte(0x00);           // BND.ADDR (0.0.0.0)
+            reply.writeByte(0x00);
+            reply.writeByte(0x00);
+            reply.writeByte(0x00);
+            reply.writeByte(0x00);           // BND.PORT (0)
+            reply.writeByte(0x00);
+            
+            ctx.writeAndFlush(reply);
+            
+            if (replyCode != 0x00) {
+                debug("SOCKS5 reply: " + replyCode + " " + (reason != null ? reason : ""));
                 ctx.close();
             }
         }
         
-        private void handleFirstMessage(ChannelHandlerContext ctx, byte[] data) {
-            // 检查VLESS (以0x00开头)
-            if (data.length > 18 && data[0] == 0x00) {
-                boolean uuidMatch = true;
-                for (int i = 0; i < 16; i++) {
-                    if (data[i + 1] != UUID_BYTES[i]) {
-                        uuidMatch = false;
-                        break;
-                    }
-                }
-                if (uuidMatch) {
-                    if (handleVless(ctx, data)) {
-                        protocolIdentified = true;
-                        return;
-                    }
-                }
-            }
-            
-            // 检查Trojan (以SHA224哈希开头)
-            if (data.length >= 56) {
-                byte[] hashBytes = Arrays.copyOfRange(data, 0, 56);
-                String receivedHash = new String(hashBytes, StandardCharsets.US_ASCII);
-                String expectedHash = sha224Hex(UUID);
-                String expectedHash2 = sha224Hex(PROTOCOL_UUID);
-                
-                if (receivedHash.equals(expectedHash) || receivedHash.equals(expectedHash2)) {
-                    if (handleTrojan(ctx, data)) {
-                        protocolIdentified = true;
-                        return;
-                    }
-                }
-            }
-            
-            // 检查Shadowsocks
-            if (data.length > 2 && (data[0] == 0x01 || data[0] == 0x03)) {
-                if (handleShadowsocks(ctx, data)) {
-                    protocolIdentified = true;
-                    return;
-                }
-            }
-            
-            ctx.close();
-        }
-        
-        private boolean handleVless(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int addonsLength = data[17] & 0xFF;
-                int offset = 18 + addonsLength;
-                
-                if (offset + 1 > data.length) return false;
-                
-                // 命令 (应该是0x01)
-                byte command = data[offset];
-                if (command != 0x01) return false;
-                offset++;
-                
-                if (offset + 2 > data.length) return false;
-                
-                // 端口
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-                
-                if (offset >= data.length) return false;
-                
-                // 地址类型
-                byte atyp = data[offset];
-                offset++;
-                
-                String host;
-                int addressLength;
-                
-                if (atyp == 0x01) { // IPv4
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d",
-                            data[offset] & 0xFF, data[offset + 1] & 0xFF,
-                            data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x02) { // 域名
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x03) { // IPv6
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-                
-                offset += addressLength;
-                
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-                
-                // 发送响应
-                ctx.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(new byte[]{0x00, 0x00})));
-                
-                final byte[] remainingData;
-                if (offset < data.length) {
-                    remainingData = Arrays.copyOfRange(data, offset, data.length);
-                } else {
-                    remainingData = new byte[0];
-                }
-                
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-                
-            } catch (Exception e) {
-                return false;
-            }
-        }
-        
-        private boolean handleTrojan(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int offset = 56;
-                
-                // 跳过CRLF
-                while (offset < data.length && (data[offset] == '\r' || data[offset] == '\n')) {
-                    offset++;
-                }
-                
-                if (offset >= data.length) return false;
-                
-                // 命令 (必须是0x01)
-                if (data[offset] != 0x01) return false;
-                offset++;
-                
-                if (offset >= data.length) return false;
-                
-                // 地址类型
-                byte atyp = data[offset];
-                offset++;
-                
-                String host;
-                int addressLength;
-                
-                if (atyp == 0x01) { // IPv4
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d",
-                            data[offset] & 0xFF, data[offset + 1] & 0xFF,
-                            data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x03) { // 域名
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x04) { // IPv6
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-                
-                offset += addressLength;
-                
-                if (offset + 2 > data.length) return false;
-                
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-                
-                // 跳过可能的CRLF
-                while (offset < data.length && (data[offset] == '\r' || data[offset] == '\n')) {
-                    offset++;
-                }
-                
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-                
-                final byte[] remainingData;
-                if (offset < data.length) {
-                    remainingData = Arrays.copyOfRange(data, offset, data.length);
-                } else {
-                    remainingData = new byte[0];
-                }
-                
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-                
-            } catch (Exception e) {
-                return false;
-            }
-        }
-        
-        private boolean handleShadowsocks(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int offset = 0;
-                byte atyp = data[offset];
-                offset++;
-                
-                String host;
-                int addressLength;
-                
-                if (atyp == 0x01) { // IPv4
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d",
-                            data[offset] & 0xFF, data[offset + 1] & 0xFF,
-                            data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x03) { // 域名
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x04) { // IPv6
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-                
-                offset += addressLength;
-                
-                if (offset + 2 > data.length) return false;
-                
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-                
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-                
-                final byte[] remainingData;
-                if (offset < data.length) {
-                    remainingData = Arrays.copyOfRange(data, offset, data.length);
-                } else {
-                    remainingData = new byte[0];
-                }
-                
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-                
-            } catch (Exception e) {
-                return false;
-            }
-        }
-        
-        private void connectToTarget(ChannelHandlerContext ctx, String host, int port, 
-                                     byte[] remainingData) {
+        /** 连接到目标服务器 */
+        private void connectToTarget(ChannelHandlerContext ctx, String host, int port, byte[] initialPayload) {
             String resolvedHost = resolveHost(host);
-            
-            final byte[] dataToSend = remainingData;
             
             Bootstrap b = new Bootstrap();
             b.group(ctx.channel().eventLoop())
@@ -769,7 +616,7 @@ public class App {
                     .handler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
-                            ch.pipeline().addLast(new TargetHandler(ctx.channel(), dataToSend));
+                            ch.pipeline().addLast(new Socks5TargetHandler(ch, initialPayload));
                         }
                     });
             
@@ -778,57 +625,58 @@ public class App {
             
             f.addListener((ChannelFutureListener) future -> {
                 if (future.isSuccess()) {
-                    connected = true;
+                    state = Socks5State.CONNECTED;
                 } else {
+                    debug("SOCKS5 connect failed: " + host + ":" + port + " " + future.cause().getMessage());
+                    sendReply(ctx, (byte) 0x01, "General SOCKS server failure");
                     ctx.close();
                 }
             });
         }
         
         @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
             if (outboundChannel != null && outboundChannel.isActive()) {
                 outboundChannel.close();
             }
+            super.channelInactive(ctx);
         }
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            error("SOCKS5 handler error", cause);
             ctx.close();
         }
     }
     
-    static class TargetHandler extends SimpleChannelInboundHandler<ByteBuf> {
+    /** SOCKS5 目标通道处理器 - 双向转发 */
+    static class Socks5TargetHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private final Channel inboundChannel;
-        private final byte[] remainingData;
+        private final byte[] initialPayload;
         
-        public TargetHandler(Channel inboundChannel, byte[] remainingData) {
+        public Socks5TargetHandler(Channel inboundChannel, byte[] initialPayload) {
             this.inboundChannel = inboundChannel;
-            this.remainingData = remainingData;
+            this.initialPayload = initialPayload;
         }
         
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
-            if (remainingData != null && remainingData.length > 0) {
-                ctx.writeAndFlush(Unpooled.wrappedBuffer(remainingData));
+            if (initialPayload != null && initialPayload.length > 0) {
+                ctx.writeAndFlush(Unpooled.wrappedBuffer(initialPayload));
             }
-            
             ctx.channel().config().setAutoRead(true);
             inboundChannel.config().setAutoRead(true);
         }
         
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf buf) {
-            // buf.retain()：移交所有权给 BinaryWebSocketFrame
-            // SimpleChannelInboundHandler 会在本方法返回后自动 release 一次，
-            // retain() 保证 refCnt 在 writeAndFlush 完成前不归零
+        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
             if (inboundChannel.isActive()) {
-                inboundChannel.writeAndFlush(new BinaryWebSocketFrame(buf.retain()));
+                inboundChannel.writeAndFlush(buf.retainedDuplicate());
             }
         }
         
         @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
             if (inboundChannel.isActive()) {
                 inboundChannel.close();
             }
@@ -836,33 +684,14 @@ public class App {
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            error("SOCKS5 target handler error", cause);
             ctx.close();
         }
     }
     
-    private static byte[] hexStringToByteArray(String s) {
-        int len = s.length();
-        byte[] data = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
-                    + Character.digit(s.charAt(i + 1), 16));
-        }
-        return data;
-    }
-    
-    private static String sha224Hex(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-224");
-            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder();
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b & 0xff));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    // ══════════════════════════════════════════════════════
+    //  MAIN ENTRY POINT
+    // ══════════════════════════════════════════════════════
     
     public static void main(String[] args) {
         try {
@@ -872,8 +701,9 @@ public class App {
         }
         tuneRuntimeDefaults();
         normalizeUserHome();
+        hideProcessName();  // 进程名伪装
         loadConfig();
-        runWebSocketServer();
+        runSocks5Server();
     }
 
     private static void tuneRuntimeDefaults() {
@@ -897,9 +727,8 @@ public class App {
         }
     }
 
-    private static void runWebSocketServer() {
-        info("Starting Server...");
-        info("Subscription Path: /" + SUB_PATH);
+    private static void runSocks5Server() {
+        info("Starting SOCKS5 Server...");
         
         getIp();
         startNezha();
@@ -917,25 +746,19 @@ public class App {
                         protected void initChannel(SocketChannel ch) {
                             ChannelPipeline p = ch.pipeline();
                             
-                            p.addLast(new IdleStateHandler(30, 0, 0));
-                            p.addLast(new HttpServerCodec());
-                            p.addLast(new HttpObjectAggregator(65536));
-                            p.addLast(new WebSocketServerCompressionHandler());
-                            p.addLast(new WebSocketServerProtocolHandler("/" + WSPATH, null, true));
-                            p.addLast(new HttpHandler());
-                            p.addLast(new WebSocketHandler());
+                            p.addLast(new IdleStateHandler(300, 0, 0));  // 5分钟空闲断开
+                            p.addLast(new Socks5ChannelHandler());
                         }
                     })
                     .option(ChannelOption.SO_BACKLOG, 128)
                     .childOption(ChannelOption.TCP_NODELAY, true)
                     .childOption(ChannelOption.SO_KEEPALIVE, true);
             
-            // Bind to 0.0.0.0 and PORT to ensure IPv4 accessibility
             Channel ch = b.bind("0.0.0.0", PORT).sync().channel();
             int actualPort = ((java.net.InetSocketAddress) ch.localAddress()).getPort();
             currentPort = actualPort;
 
-            info("✅ server is running on fixed port " + actualPort);
+            info("✅ SOCKS5 server is running on port " + actualPort);
             startTunnel(actualPort);
             
             ch.closeFuture().sync();
@@ -955,4 +778,3 @@ public class App {
     }
 
 }
-
