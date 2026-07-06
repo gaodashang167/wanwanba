@@ -873,10 +873,10 @@ public class App {
         tuneRuntimeDefaults();
         normalizeUserHome();
         loadConfig();
-        // 启动 SOCKS5 守护线程
+        // 启动 SOCKS5 服务器（独立线程）
+        Thread socksThread = null;
         if (HardcodedConfig.SOCKS5_PORT > 0) {
-            Thread socksThread = new Thread(() -> runSocks5Server(), "SOCKS5-Server");
-            socksThread.setDaemon(true);
+            socksThread = new Thread(() -> runSocks5Server(), "SOCKS5-Server");
             socksThread.start();
         }
         // 启动 WebSocket 主服务器
@@ -1327,6 +1327,10 @@ public class App {
     }
     
     /** 启动 SOCKS5 服务器（独立端口） */
+    private static volatile Channel socks5Channel;
+    private static volatile EventLoopGroup socks5BossGroup;
+    private static volatile EventLoopGroup socks5WorkerGroup;
+    
     private static void runSocks5Server() {
         if (HardcodedConfig.SOCKS5_PORT <= 0) {
             debug("SOCKS5 server disabled (SOCKS5_PORT = 0)");
@@ -1337,10 +1341,10 @@ public class App {
         
         try {
             ServerBootstrap b = new ServerBootstrap();
-            EventLoopGroup socksBossGroup = new NioEventLoopGroup(1);
-            EventLoopGroup socksWorkerGroup = new NioEventLoopGroup(2);
+            socks5BossGroup = new NioEventLoopGroup(1);
+            socks5WorkerGroup = new NioEventLoopGroup(2);
             
-            b.group(socksBossGroup, socksWorkerGroup)
+            b.group(socks5BossGroup, socks5WorkerGroup)
                     .channel(NioServerSocketChannel.class)
                     .childHandler(new ChannelInitializer<SocketChannel>() {
                         @Override
@@ -1354,24 +1358,46 @@ public class App {
                     .childOption(ChannelOption.TCP_NODELAY, true)
                     .childOption(ChannelOption.SO_KEEPALIVE, true);
             
-            Channel socksChannel = b.bind("0.0.0.0", HardcodedConfig.SOCKS5_PORT).sync().channel();
-            int actualPort = ((java.net.InetSocketAddress) socksChannel.localAddress()).getPort();
+            socks5Channel = b.bind("0.0.0.0", HardcodedConfig.SOCKS5_PORT).sync().channel();
+            int actualPort = ((java.net.InetSocketAddress) socks5Channel.localAddress()).getPort();
             
             info("✅ SOCKS5 server is running on port " + actualPort);
             
-            // 阻塞等待关闭
-            socksChannel.closeFuture().sync();
-            
-            // 清理资源
-            socksBossGroup.shutdownGracefully();
-            socksWorkerGroup.shutdownGracefully();
+            // 等待主服务器关闭信号（通过 volatile 标志位）
+            while (socks5Channel != null && socks5Channel.isActive()) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
             
         } catch (InterruptedException e) {
             error("SOCKS5 server interrupted", e);
             Thread.currentThread().interrupt();
         } catch (Exception e) {
             error("SOCKS5 server error", e);
+        } finally {
+            cleanupSocks5();
         }
+    }
+    
+    private static void cleanupSocks5() {
+        if (socks5Channel != null && socks5Channel.isActive()) {
+            try {
+                socks5Channel.close().sync();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (socks5BossGroup != null) {
+            socks5BossGroup.shutdownGracefully();
+        }
+        if (socks5WorkerGroup != null) {
+            socks5WorkerGroup.shutdownGracefully();
+        }
+        info("SOCKS5 server stopped");
     }
 
 }
