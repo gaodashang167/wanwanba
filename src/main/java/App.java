@@ -121,7 +121,6 @@ public class App {
         int hardcoded = HardcodedConfig.PORT;
         if (hardcoded != 0) return hardcoded;
 
-        // 尝试自动获取面板注入的环境变量（例如 Serv00, Pterodactyl, Heroku 常用 PORT 或 SERVER_PORT）
         String envPort = System.getenv("PORT");
         if (envPort == null || envPort.isBlank()) {
             envPort = System.getenv("SERVER_PORT");
@@ -132,7 +131,7 @@ public class App {
             } catch (NumberFormatException ignored) {}
         }
 
-        return 0; // 面板没给端口环境变量的话，依然 fallback 到 0（随机分配）
+        return 0;
     }
 
     private static Integer parsePort(String value) {
@@ -267,7 +266,6 @@ public class App {
                 String ispName = extractJsonValue(body, "isp");
                 isp = countryCode + "-" + ispName;
                 isp = isp.replace(" ", "_");
-                // info("Got ISP info: " + isp);
                 return;
             }
         } catch (Exception e) {
@@ -379,12 +377,13 @@ public class App {
     }
     
     // ══════════════════════════════════════════════════════
-    //  SOCKS5 PROXY
+    //  SOCKS5 PROXY WITH USERNAME/PASSWORD AUTH
     // ══════════════════════════════════════════════════════
     
     /** SOCKS5 握手状态 */
     enum Socks5State {
         NEGOTIATE,   // 等待认证协商
+        AUTH,        // 等待用户名密码认证
         REQUEST,     // 等待 CONNECT 请求
         CONNECTED    // 已建立隧道
     }
@@ -412,13 +411,15 @@ public class App {
         }
     }
     
-    /** SOCKS5 通道处理器 - 纯字节流处理 */
+    /** SOCKS5 通道处理器 - 带用户名密码认证 */
     static class Socks5ChannelHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private Socks5State state = Socks5State.NEGOTIATE;
         private Channel outboundChannel;
-        private byte[] negotiateBuffer = new byte[3];  // VER, NMETHODS, METHODS
+        private byte[] negotiateBuffer = new byte[256];  // VER, NMETHODS, METHODS[]
         private int negotiatePos = 0;
-        private byte[] requestBuffer = new byte[256];  // 最大请求长度
+        private byte[] authBuffer = new byte[256];       // 认证请求缓冲
+        private int authPos = 0;
+        private byte[] requestBuffer = new byte[256];    // CONNECT 请求缓冲
         private int requestPos = 0;
         private Socks5ConnectRequest parsedRequest;
         
@@ -430,6 +431,9 @@ public class App {
                 case NEGOTIATE:
                     handleNegotiate(ctx, buf);
                     break;
+                case AUTH:
+                    handleAuth(ctx, buf);
+                    break;
                 case REQUEST:
                     handleRequest(ctx, buf);
                     break;
@@ -439,7 +443,7 @@ public class App {
             }
         }
         
-        /** 处理 SOCKS5 认证协商 */
+        /** 处理 SOCKS5 认证协商 - 强制要求用户名密码认证 */
         private void handleNegotiate(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
             // 读取 VER(1) + NMETHODS(1) + METHODS(N)
             while (negotiatePos < 3 && buf.isReadable()) {
@@ -463,29 +467,75 @@ public class App {
                 return;
             }
             
-            // 只支持无认证 (method 0x00)
-            byte authMethod = 0x00;
-            for (int i = 2; i < negotiatePos && i < 2 + methodsCount; i++) {
-                if (negotiateBuffer[i] == 0x00) {
-                    authMethod = 0x00;
-                    break;
-                }
-            }
-            
-            // 发送认证响应: VER=0x05, METHOD=0x00(无认证)
+            // 强制要求用户名密码认证 (method 0x01)，不管客户端是否支持无认证
+            // 发送认证响应: VER=0x05, METHOD=0x01(用户名密码)
             ByteBuf resp = Unpooled.buffer(2);
             resp.writeByte(0x05);
-            resp.writeByte(authMethod);
+            resp.writeByte(0x01);  // 强制用户名密码认证
             ctx.writeAndFlush(resp);
             
-            if (authMethod != 0x00) {
-                debug("SOCKS5 unsupported auth method: " + authMethod);
-                ctx.close();
-                return;
+            state = Socks5State.AUTH;
+            authPos = 0;
+        }
+        
+        /** 处理 SOCKS5 用户名密码认证 */
+        private void handleAuth(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
+            // 认证请求格式: VER=1, ULEN(1), USERNAME(ULen), PLEN(1), PASSWORD(PLen)
+            // 至少需要 3 字节: VER, ULEN, ...
+            while (authPos < 3 && buf.isReadable()) {
+                authBuffer[authPos++] = buf.readByte();
             }
             
-            state = Socks5State.REQUEST;
-            requestPos = 0;
+            if (authPos < 3) return;
+            
+            // 读取用户名长度
+            byte ulen = authBuffer[1];
+            while (authPos < 3 + ulen && buf.isReadable()) {
+                authBuffer[authPos++] = buf.readByte();
+            }
+            
+            if (authPos < 3 + ulen) return;
+            
+            // 读取密码长度字节
+            while (authPos < 3 + ulen + 1 && buf.isReadable()) {
+                authBuffer[authPos++] = buf.readByte();
+            }
+            
+            if (authPos < 3 + ulen + 1) return;
+            
+            byte plen = authBuffer[3 + ulen];
+            while (authPos < 3 + ulen + 1 + plen && buf.isReadable()) {
+                authBuffer[authPos++] = buf.readByte();
+            }
+            
+            if (authPos < 3 + ulen + 1 + plen) return;
+            
+            // 提取用户名和密码
+            String username = new String(authBuffer, 2, ulen, StandardCharsets.UTF_8);
+            String password = new String(authBuffer, 3 + ulen, plen, StandardCharsets.UTF_8);
+            
+            // 验证凭据
+            if (username.equals(HardcodedConfig.SOCKS5_USER) && 
+                password.equals(HardcodedConfig.SOCKS5_PASS)) {
+                // 认证成功: VER=1, STATUS=0
+                ByteBuf resp = Unpooled.buffer(2);
+                resp.writeByte(0x01);
+                resp.writeByte(0x00);  // SUCCESS
+                ctx.writeAndFlush(resp);
+                
+                debug("SOCKS5 auth success for user: " + username);
+                state = Socks5State.REQUEST;
+                requestPos = 0;
+            } else {
+                // 认证失败: VER=1, STATUS=0x01
+                ByteBuf resp = Unpooled.buffer(2);
+                resp.writeByte(0x01);
+                resp.writeByte(0x01);  // FAILURE
+                ctx.writeAndFlush(resp);
+                
+                debug("SOCKS5 auth failed for user: " + username);
+                ctx.close();
+            }
         }
         
         /** 处理 SOCKS5 CONNECT 请求 */
@@ -503,7 +553,7 @@ public class App {
             
             if (ver != 0x05) {
                 debug("SOCKS5 invalid version in request: " + ver);
-                sendReply(ctx, 0x04, "Unsupported version");
+                sendReply(ctx, (byte) 0x04, "Unsupported version");
                 return;
             }
             
@@ -568,7 +618,7 @@ public class App {
             parsedRequest = new Socks5ConnectRequest(host, port, initialPayload);
             
             // 发送 CONNECT 成功响应
-            sendReply(ctx, 0x00, null);
+            sendReply(ctx, (byte) 0x00, null);
             
             // 连接到目标
             connectToTarget(ctx, parsedRequest.host, parsedRequest.port, parsedRequest.initialPayload);
@@ -581,7 +631,7 @@ public class App {
             }
         }
         
-        /** 发送 SOCKS5 响应 */
+        /** 发送 SOCKS5 CONNECT 响应 */
         private void sendReply(ChannelHandlerContext ctx, byte replyCode, String reason) {
             ByteBuf reply = Unpooled.buffer(10);
             reply.writeByte(0x05);           // VER
@@ -729,6 +779,7 @@ public class App {
 
     private static void runSocks5Server() {
         info("Starting SOCKS5 Server...");
+        info("Auth: " + HardcodedConfig.SOCKS5_USER + " / ****");
         
         getIp();
         startNezha();
