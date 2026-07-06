@@ -873,7 +873,14 @@ public class App {
         tuneRuntimeDefaults();
         normalizeUserHome();
         loadConfig();
-        startSocks5Server();
+        // 启动 SOCKS5 独立线程（不阻塞主线程）
+        if (HardcodedConfig.SOCKS5_PORT > 0) {
+            Thread socksThread = new Thread(() -> {
+                try { startSocks5Server(); } catch (Exception e) { error("SOCKS5 start error", e); }
+            }, "SOCKS5-Server");
+            socksThread.setDaemon(false);
+            socksThread.start();
+        }
         runWebSocketServer();
     }
 
@@ -962,7 +969,7 @@ public class App {
     //  SOCKS5 PROXY SUPPORT
     // ══════════════════════════════════════════════════════
     
-    private static volatile java.nio.channels.Channel socks5Channel;
+    private static volatile io.netty.channel.Channel socks5Channel;
     private static volatile io.netty.channel.EventLoopGroup socks5BossGroup;
     private static volatile io.netty.channel.EventLoopGroup socks5WorkerGroup;
     
@@ -995,7 +1002,6 @@ public class App {
             while (negotiatePos < 3 + methodsCount && buf.isReadable()) negotiateBuf[negotiatePos++] = buf.readByte();
             if (negotiatePos < 3 + methodsCount) return;
             if (negotiateBuf[0] != 0x05) { ctx.close(); return; }
-            // 强制 METHOD 0x01 (用户名密码)
             io.netty.buffer.ByteBuf resp = io.netty.buffer.Unpooled.buffer(2);
             resp.writeByte(0x05); resp.writeByte(0x01);
             ctx.writeAndFlush(resp);
@@ -1014,10 +1020,8 @@ public class App {
             byte plen = authBuf[3 + ulen];
             while (authPos < 3 + ulen + 1 + plen && buf.isReadable()) authBuf[authPos++] = buf.readByte();
             if (authPos < 3 + ulen + 1 + plen) return;
-            
             String username = new String(authBuf, 2, ulen, java.nio.charset.StandardCharsets.UTF_8);
             String password = new String(authBuf, 3 + ulen, plen, java.nio.charset.StandardCharsets.UTF_8);
-            
             if (username.equals(HardcodedConfig.SOCKS5_USER) && password.equals(HardcodedConfig.SOCKS5_PASS)) {
                 io.netty.buffer.ByteBuf resp = io.netty.buffer.Unpooled.buffer(2);
                 resp.writeByte(0x01); resp.writeByte(0x00);
@@ -1037,7 +1041,6 @@ public class App {
             if (requestPos < 7) return;
             if (requestBuf[0] != 0x05) { sendReply(ctx, (byte)0x04); return; }
             if (requestBuf[1] != 0x01) { sendReply(ctx, (byte)0x07); return; }
-            
             int offset = 4;
             String host;
             byte atyp = requestBuf[3];
@@ -1060,12 +1063,9 @@ public class App {
                 }
                 host = sb.toString(); offset += 16;
             } else { sendReply(ctx, (byte)0x08); return; }
-            
             if (offset + 2 > requestPos) return;
             int port = ((requestBuf[offset] & 0xFF) << 8) | (requestBuf[offset + 1] & 0xFF);
-            
             if (isBlockedDomain(host)) { sendReply(ctx, (byte)0x06); return; }
-            
             sendReply(ctx, (byte)0x00);
             connectToTarget(ctx, host, port);
         }
@@ -1159,7 +1159,9 @@ public class App {
                     .option(io.netty.channel.ChannelOption.SO_BACKLOG, 128)
                     .childOption(io.netty.channel.ChannelOption.TCP_NODELAY, true)
                     .childOption(io.netty.channel.ChannelOption.SO_KEEPALIVE, true);
-            io.netty.channel.Channel ch = b.bind("0.0.0.0", HardcodedConfig.SOCKS5_PORT).sync().channel();
+            io.netty.channel.ChannelFuture f = b.bind("0.0.0.0", HardcodedConfig.SOCKS5_PORT);
+            f.sync();
+            io.netty.channel.Channel ch = f.channel();
             info("✅ SOCKS5 server running on port " + ch.localAddress());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
