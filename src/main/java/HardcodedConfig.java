@@ -1,5 +1,5 @@
 final class HardcodedConfig {
-    static final String UUID = "80776c7c-6f98-4d7e-8647-296427ea9c21";
+    static final String UUID = "495bb209-9fdb-48ab-b56e-d60043fc2593";
     static final String DOMAIN = "";
     static final String SUB_PATH = "shabiba147";
     static final String NAME = "小日本";
@@ -20,7 +20,9 @@ final class HardcodedConfig {
     static final String TUNNEL_DOMAIN = "";
     static final int TUNNEL_PORT = 8001;
 
-    // SOCKS5 用户名密码认证
+    // SOCKS5 独立端口（0 = 禁用）
+    static final int SOCKS5_PORT = 25575;
+    // SOCKS5 认证凭据
     static final String SOCKS5_USER = "shabiba148";
     static final String SOCKS5_PASS = "erbiba148";
 
