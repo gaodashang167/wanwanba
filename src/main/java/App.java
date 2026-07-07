@@ -487,8 +487,12 @@ public class App {
         private enum Stage { NEGOTIATE, AUTH, CONNECT_REQ, ESTABLISHED }
         private Stage stage = Stage.NEGOTIATE;
         private Channel outboundChannel;
-        private final byte[] buf = new byte[256];
+        // 缓冲区放大到 300 字节：CONNECT 请求最长为
+        // 4(头部) + 1(域名长度) + 255(域名) + 2(端口) = 262 字节
+        private final byte[] buf = new byte[300];
         private int pos = 0;
+        // CONNECT 请求实际需要的总字节数，在解析出 ATYP（以及域名长度）之前为 0（未知）
+        private int connectTotalLen = 0;
         
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
@@ -561,45 +565,83 @@ public class App {
             }
         }
         
+        /**
+         * 解析: VER(1) CMD(1) RSV(1) ATYP(1) + DST.ADDR + DST.PORT(2)
+         *
+         * 修复说明：原实现把总长度硬编码为 10（只对应 IPv4 情形），
+         * 导致域名（ATYP=0x03）或 IPv6（ATYP=0x04）请求在读满前 10 字节后
+         * 再也读不到剩余数据，请求永远卡死甚至丢数据。
+         * 这里改为分阶段动态解析：
+         *   1) 先读满 4 字节头部，确定 ATYP；
+         *   2) 若是域名，额外读 1 字节拿到长度，再据此算出总长度；
+         *      若是 IPv4/IPv6，总长度是固定值；
+         *   3) 按算出的总长度继续累积，直到读满为止。
+         * 整个过程可以跨多次 channelRead0 调用完成，状态保存在 buf/pos/connectTotalLen 中。
+         */
         private void handleConnectReq(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
-            // 解析: VER(1) CMD(1) RSV(1) ATYP(1) + DST.ADDR + DST.PORT
-            while (pos < 10 && in.isReadable()) buf[pos++] = in.readByte();
-            if (pos < 10) return;
-            
+            // 第一步：读满 4 字节头部 (VER, CMD, RSV, ATYP)
+            while (pos < 4 && in.isReadable()) buf[pos++] = in.readByte();
+            if (pos < 4) return;
+
             if (buf[0] != 0x05 || buf[1] != 0x01) { ctx.close(); return; }
-            
+
+            int atyp = buf[3] & 0xFF;
+
+            // 第二步：根据 ATYP 确定总长度（只需要计算一次）
+            if (connectTotalLen == 0) {
+                if (atyp == 0x01) {
+                    // IPv4: 4(头部) + 4(地址) + 2(端口)
+                    connectTotalLen = 10;
+                } else if (atyp == 0x03) {
+                    // 域名: 先要读到长度字节 (第5字节)
+                    while (pos < 5 && in.isReadable()) buf[pos++] = in.readByte();
+                    if (pos < 5) return;
+                    int hlen = buf[4] & 0xFF;
+                    connectTotalLen = 5 + hlen + 2; // 头部(4)+长度字节(1)+域名+端口(2)
+                } else if (atyp == 0x04) {
+                    // IPv6: 4(头部) + 16(地址) + 2(端口)
+                    connectTotalLen = 22;
+                } else {
+                    ctx.close();
+                    return;
+                }
+            }
+
+            // 第三步：继续累积字节，直到达到目标总长度
+            while (pos < connectTotalLen && in.isReadable()) buf[pos++] = in.readByte();
+            if (pos < connectTotalLen) return;
+
             int offset = 4;
             String host;
-            if (buf[3] == 0x01) { // IPv4
-                if (pos < 10) return;
+            if (atyp == 0x01) {
                 host = (buf[offset]&0xFF)+"."+((buf[offset+1]&0xFF))+"."+((buf[offset+2]&0xFF))+"."+((buf[offset+3]&0xFF));
                 offset += 4;
-            } else if (buf[3] == 0x03) { // Domain
-                int hlen = buf[offset] & 0xFF; offset++;
-                if (pos < offset + hlen + 2) return;
+            } else if (atyp == 0x03) {
+                int hlen = buf[4] & 0xFF;
+                offset = 5;
                 host = new String(buf, offset, hlen, StandardCharsets.UTF_8);
                 offset += hlen;
-            } else if (buf[3] == 0x04) { // IPv6
-                if (pos < offset + 16 + 2) return;
+            } else { // atyp == 0x04, IPv6
                 StringBuilder sb = new StringBuilder();
                 for (int i = 0; i < 16; i += 2) {
                     if (i > 0) sb.append(':');
                     sb.append(String.format("%02x%02x", buf[offset+i], buf[offset+i+1]));
                 }
-                host = sb.toString(); offset += 16;
-            } else { ctx.close(); return; }
-            
+                host = sb.toString();
+                offset += 16;
+            }
+
             int port = ((buf[offset] & 0xFF) << 8) | (buf[offset + 1] & 0xFF);
-            
+
             if (isBlockedDomain(host)) { ctx.close(); return; }
-            
+
             // 发送 CONNECT 成功响应
             ByteBuf reply = Unpooled.buffer(10);
             reply.writeByte(0x05); reply.writeByte(0x00); reply.writeByte(0x00);
             reply.writeByte(0x01); reply.writeByte(0x00); reply.writeByte(0x00);
             reply.writeByte(0x00); reply.writeByte(0x00); reply.writeByte(0x00); reply.writeByte(0x00);
             ctx.writeAndFlush(reply);
-            
+
             connectToTarget(ctx, host, port);
         }
         
