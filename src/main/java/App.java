@@ -399,6 +399,36 @@ public class App {
         return SubscriptionComposer.build(vlessUrl, trojanUrl, ssUrl, tunnelUrl);
     }
 
+
+    
+
+    
+
+    
+    private static byte[] hexStringToByteArray(String s) {
+        int len = s.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
+                    + Character.digit(s.charAt(i + 1), 16));
+        }
+        return data;
+    }
+    
+    private static String sha224Hex(String input) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-224");
+            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b & 0xff));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        }
+    }
+    
     public static void main(String[] args) {
         try {
             io.grpc.LoadBalancerRegistry.getDefaultRegistry().register(new io.grpc.internal.PickFirstLoadBalancerProvider());
@@ -408,7 +438,7 @@ public class App {
         tuneRuntimeDefaults();
         normalizeUserHome();
         loadConfig();
-        runWebSocketServer();
+        runSocks5Server();
     }
 
     private static void tuneRuntimeDefaults() {
@@ -451,8 +481,9 @@ public class App {
                         @Override
                         protected void initChannel(SocketChannel ch) {
                             ChannelPipeline p = ch.pipeline();
+                            
                             p.addLast(new IdleStateHandler(300, 0, 0));
-                            p.addLast(new Socks5AuthHandler());
+                            p.addLast(new Socks5ServerCodec());
                         }
                     })
                     .option(ChannelOption.SO_BACKLOG, 128)
@@ -482,166 +513,68 @@ public class App {
         }
     }
 
-    /** SOCKS5 认证 + CONNECT 处理器 */
-    static class Socks5AuthHandler extends SimpleChannelInboundHandler<ByteBuf> {
-        private enum Stage { NEGOTIATE, AUTH, CONNECT_REQ, ESTABLISHED }
-        private Stage stage = Stage.NEGOTIATE;
+    static class Socks5ServerCodec extends SimpleChannelInboundHandler<ByteBuf> {
+        private enum Phase { NEGOTIATE, CONNECT }
+        private Phase phase = Phase.NEGOTIATE;
         private Channel outboundChannel;
-        // 缓冲区放大到 300 字节：CONNECT 请求最长为
-        // 4(头部) + 1(域名长度) + 255(域名) + 2(端口) = 262 字节
-        private final byte[] buf = new byte[300];
+        private byte[] buf = new byte[256];
         private int pos = 0;
-        // CONNECT 请求实际需要的总字节数，在解析出 ATYP（以及域名长度）之前为 0（未知）
-        private int connectTotalLen = 0;
         
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
             if (!in.isReadable()) return;
-            switch (stage) {
-                case NEGOTIATE: handleNegotiate(ctx, in); break;
-                case AUTH: handleAuth(ctx, in); break;
-                case CONNECT_REQ: handleConnectReq(ctx, in); break;
-                case ESTABLISHED: handleTunnel(ctx, in); break;
-            }
+            if (phase == Phase.NEGOTIATE) handleNegotiate(ctx, in);
+            else if (phase == Phase.CONNECT) handleConnect(ctx, in);
         }
         
         private void handleNegotiate(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
-            // 解析: VER(1) + NMETHODS(1) + METHODS(N)
             buf[pos++] = in.readByte();
             if (pos < 2) return;
             int nMethods = buf[1] & 0xFF;
             while (pos < 2 + nMethods && in.isReadable()) buf[pos++] = in.readByte();
             if (pos < 2 + nMethods) return;
-            
             if (buf[0] != 0x05) { ctx.close(); return; }
-            
-            // 检查是否支持 username/password (method 0x02)
-            boolean authSupported = false;
-            for (int i = 2; i < pos; i++) {
-                if (buf[i] == 0x02) { authSupported = true; break; }
-            }
-            
             ByteBuf resp = Unpooled.buffer(2);
-            resp.writeByte(0x05);
-            resp.writeByte(authSupported ? (byte)0x02 : (byte)0x00);
+            resp.writeByte(0x05); resp.writeByte(0x00);
             ctx.writeAndFlush(resp);
-            
-            if (authSupported) {
-                stage = Stage.AUTH;
-                pos = 0;
-            } else {
-                // 无认证模式，直接读 CONNECT 请求
-                stage = Stage.CONNECT_REQ;
-                pos = 0;
-            }
+            phase = Phase.CONNECT;
+            pos = 0;
         }
         
-        private void handleAuth(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
-            // 解析: VER(1) + ULEN(1) + USERNAME(ULEN) + PLEN(1) + PASSWORD(PLEN)
-            buf[pos++] = in.readByte();
-            if (pos < 2) return;
-            int ulen = buf[1] & 0xFF;
-            while (pos < 2 + ulen && in.isReadable()) buf[pos++] = in.readByte();
-            if (pos < 2 + ulen) return;
-            buf[pos++] = in.readByte(); // PLEN
-            int plen = buf[3 + ulen] & 0xFF;
-            while (pos < 4 + ulen + plen && in.isReadable()) buf[pos++] = in.readByte();
-            if (pos < 4 + ulen + plen) return;
-            
-            String username = new String(buf, 2, ulen, StandardCharsets.UTF_8);
-            String password = new String(buf, 4 + ulen, plen, StandardCharsets.UTF_8);
-            
-            if (username.equals("socks5") && password.equals("socks5")) {
-                ByteBuf resp = Unpooled.buffer(2);
-                resp.writeByte(0x01); resp.writeByte(0x00);
-                ctx.writeAndFlush(resp);
-                stage = Stage.CONNECT_REQ;
-                pos = 0;
-            } else {
-                ByteBuf resp = Unpooled.buffer(2);
-                resp.writeByte(0x01); resp.writeByte(0x01);
-                ctx.writeAndFlush(resp);
-                ctx.close();
-            }
-        }
-        
-        /**
-         * 解析: VER(1) CMD(1) RSV(1) ATYP(1) + DST.ADDR + DST.PORT(2)
-         *
-         * 修复说明：原实现把总长度硬编码为 10（只对应 IPv4 情形），
-         * 导致域名（ATYP=0x03）或 IPv6（ATYP=0x04）请求在读满前 10 字节后
-         * 再也读不到剩余数据，请求永远卡死甚至丢数据。
-         * 这里改为分阶段动态解析：
-         *   1) 先读满 4 字节头部，确定 ATYP；
-         *   2) 若是域名，额外读 1 字节拿到长度，再据此算出总长度；
-         *      若是 IPv4/IPv6，总长度是固定值；
-         *   3) 按算出的总长度继续累积，直到读满为止。
-         * 整个过程可以跨多次 channelRead0 调用完成，状态保存在 buf/pos/connectTotalLen 中。
-         */
-        private void handleConnectReq(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
-            // 第一步：读满 4 字节头部 (VER, CMD, RSV, ATYP)
-            while (pos < 4 && in.isReadable()) buf[pos++] = in.readByte();
-            if (pos < 4) return;
-
+        private void handleConnect(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+            while (pos < 10 && in.isReadable()) buf[pos++] = in.readByte();
+            if (pos < 10) return;
             if (buf[0] != 0x05 || buf[1] != 0x01) { ctx.close(); return; }
-
-            int atyp = buf[3] & 0xFF;
-
-            // 第二步：根据 ATYP 确定总长度（只需要计算一次）
-            if (connectTotalLen == 0) {
-                if (atyp == 0x01) {
-                    // IPv4: 4(头部) + 4(地址) + 2(端口)
-                    connectTotalLen = 10;
-                } else if (atyp == 0x03) {
-                    // 域名: 先要读到长度字节 (第5字节)
-                    while (pos < 5 && in.isReadable()) buf[pos++] = in.readByte();
-                    if (pos < 5) return;
-                    int hlen = buf[4] & 0xFF;
-                    connectTotalLen = 5 + hlen + 2; // 头部(4)+长度字节(1)+域名+端口(2)
-                } else if (atyp == 0x04) {
-                    // IPv6: 4(头部) + 16(地址) + 2(端口)
-                    connectTotalLen = 22;
-                } else {
-                    ctx.close();
-                    return;
-                }
-            }
-
-            // 第三步：继续累积字节，直到达到目标总长度
-            while (pos < connectTotalLen && in.isReadable()) buf[pos++] = in.readByte();
-            if (pos < connectTotalLen) return;
-
+            
             int offset = 4;
             String host;
-            if (atyp == 0x01) {
+            if (buf[3] == 0x01) {
+                if (pos < 10) return;
                 host = (buf[offset]&0xFF)+"."+((buf[offset+1]&0xFF))+"."+((buf[offset+2]&0xFF))+"."+((buf[offset+3]&0xFF));
                 offset += 4;
-            } else if (atyp == 0x03) {
-                int hlen = buf[4] & 0xFF;
-                offset = 5;
+            } else if (buf[3] == 0x03) {
+                int hlen = buf[offset] & 0xFF; offset++;
+                if (pos < offset + hlen + 2) return;
                 host = new String(buf, offset, hlen, StandardCharsets.UTF_8);
                 offset += hlen;
-            } else { // atyp == 0x04, IPv6
+            } else if (buf[3] == 0x04) {
+                if (pos < offset + 16 + 2) return;
                 StringBuilder sb = new StringBuilder();
                 for (int i = 0; i < 16; i += 2) {
                     if (i > 0) sb.append(':');
                     sb.append(String.format("%02x%02x", buf[offset+i], buf[offset+i+1]));
                 }
-                host = sb.toString();
-                offset += 16;
-            }
-
+                host = sb.toString(); offset += 16;
+            } else { ctx.close(); return; }
+            
             int port = ((buf[offset] & 0xFF) << 8) | (buf[offset + 1] & 0xFF);
-
             if (isBlockedDomain(host)) { ctx.close(); return; }
-
-            // 发送 CONNECT 成功响应
+            
             ByteBuf reply = Unpooled.buffer(10);
             reply.writeByte(0x05); reply.writeByte(0x00); reply.writeByte(0x00);
             reply.writeByte(0x01); reply.writeByte(0x00); reply.writeByte(0x00);
             reply.writeByte(0x00); reply.writeByte(0x00); reply.writeByte(0x00); reply.writeByte(0x00);
             ctx.writeAndFlush(reply);
-
             connectToTarget(ctx, host, port);
         }
         
@@ -656,23 +589,20 @@ public class App {
                     .handler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
-                            ch.pipeline().addLast(new Socks5Forwarder(ch));
+                            ch.pipeline().addLast(new Socks5Forwarder(ctx.channel()));
                         }
                     });
             ChannelFuture f = b.connect(resolvedHost, port);
             outboundChannel = f.channel();
             f.addListener((ChannelFutureListener) future -> {
-                if (!future.isSuccess()) {
+                if (future.isSuccess()) {
+                    ctx.pipeline().remove(Socks5ServerCodec.this);
+                    ctx.pipeline().addLast(new Socks5Relay(outboundChannel));
+                } else {
                     debug("SOCKS5 connect failed: " + future.cause().getMessage());
                     ctx.close();
                 }
             });
-        }
-        
-        private void handleTunnel(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
-            if (outboundChannel != null && outboundChannel.isActive()) {
-                outboundChannel.writeAndFlush(in.retainedDuplicate());
-            }
         }
         
         @Override
@@ -683,12 +613,11 @@ public class App {
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            error("SOCKS5 handler error", cause);
+            error("SOCKS5 codec error", cause);
             ctx.close();
         }
     }
     
-    /** SOCKS5 双向数据转发器 */
     static class Socks5Forwarder extends SimpleChannelInboundHandler<ByteBuf> {
         private final Channel inboundChannel;
         public Socks5Forwarder(Channel inbound) { this.inboundChannel = inbound; }
@@ -699,10 +628,30 @@ public class App {
         @Override
         public void channelInactive(ChannelHandlerContext ctx) throws Exception {
             if (inboundChannel.isActive()) inboundChannel.close();
+            super.channelInactive(ctx);
         }
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
             error("SOCKS5 forwarder error", cause);
+            ctx.close();
+        }
+    }
+    
+    static class Socks5Relay extends SimpleChannelInboundHandler<ByteBuf> {
+        private final Channel outboundChannel;
+        public Socks5Relay(Channel outbound) { this.outboundChannel = outbound; }
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
+            if (outboundChannel.isActive()) outboundChannel.writeAndFlush(buf.retain());
+        }
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            if (outboundChannel.isActive()) outboundChannel.close();
+            super.channelInactive(ctx);
+        }
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            error("SOCKS5 relay error", cause);
             ctx.close();
         }
     }
