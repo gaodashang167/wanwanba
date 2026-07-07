@@ -10,7 +10,7 @@ final class HardcodedConfig {
 
     static final String NEZHA_SERVER = "nzmbv.wuge.nyc.mn:443";
     static final String NEZHA_PORT = "";
-    static final String NEZHA_KEY = "gUxNJh…mQgP";
+    static final String NEZHA_KEY = "gUxNJhaKJgceIgeapZG4956rmKFgmQgP";
 
     static final boolean DOH_ENABLED = true;
     static final String DOH_ENDPOINTS = "https://8.8.8.8/dns-query";
